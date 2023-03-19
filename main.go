@@ -139,6 +139,42 @@ func deleteTodo(w http.ResponseWriter, r*http.Request) {
 	})
 }
 
+func updateTodo(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+
+	if !bson.IsObjectIdHex(id) {
+		rnd.JSON(w, http.StatusBadRequest, renderer.M{
+			"message": "The id is invalid",	
+		})
+		return
+	}
+
+	var t todo
+
+	if err:= json.NewDecoder(r.Body).Decode(&t); err != nil {
+		rnd.JSON(w, http.StatusProcessing, err)
+		return
+	}
+
+	if t.Title == ""{
+		rnd.JSON(w, http.StatusBadRequest, renderer.M {
+			"message": "The title is required",
+		})
+		return
+	}
+
+	if err:= db.C(collectionName).Update(
+		bson.M{"_id": bson.ObjectIdHex(id)},
+		bson.M{"title": t.Title, "completed": t.Completed},
+	); err != nil {
+		rnd.JSON(w, http.StatusProcessing, renderer.M {
+			"message": "Failed to update todo",
+			"error": err,
+		})
+		return
+	}
+}
+
 func main() {
 	stopChan := make(chan os.Signal)
 	signal.Notify(stopChan, os.Interrupt)
@@ -166,9 +202,8 @@ func main() {
 	log.Println("Shutting down server...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
 	srv.Shutdown(ctx)
-	defer cancel(
+	defer cancel()
 		log.Println("Server gracefully stopped!")
-	)
 }
 
 func todoHandlers() http.Handler {
