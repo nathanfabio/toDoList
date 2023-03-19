@@ -44,12 +44,47 @@ type (
 
 func init() {
 	rnd = renderer.New()
-	sess, err:= mgo.Dial(hostName)
+	sess, err := mgo.Dial(hostName)
 	checkErr(err)
 	sess.SetMode(mgo.Monotonic, true)
 	db = sess.DB(dbName)
 }
 
 func main() {
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Get("/", homeHandler)
+	r.Mount("/todo", todoHandlers())
 
+	srv := &http.Server{
+		Addr:         port,
+		Handler:      r,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Println("Listening on port", port)
+		if err := srv.ListenAndServe(); err != nil {
+			log.Printf("Listen:%s/n", err)
+		}
+	}()
+}
+
+func todoHandlers() http.Handler {
+	rg := chi.NewRouter()
+	rg.Group(func(r chi.Router) {
+		r.Get("/", fetchTodos)
+		r.Post("/", createTodo)
+		r.Put("/{id}", updateTodo)
+		r.Delete("/{id}", deleteTodo)
+	})
+	return rg
+}
+
+func checkErr(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
 }
