@@ -7,18 +7,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 	"github.com/thedevsaddam/renderer"
-	mgo "gopkg.in/mgo.v2"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"gopkg.in/mgo.v2/bson"
 )
 
 var rnd *renderer.Render
-var db *mgo.Database
+var collection *mongo.Collection
+var ctx = context.TODO()
 
 const (
 	hostName       string = "localhost:27017"
@@ -43,11 +44,19 @@ type (
 )
 
 func init() {
-	rnd = renderer.New()
-	sess, err := mgo.Dial(hostName)
-	checkErr(err)
-	sess.SetMode(mgo.Monotonic, true)
-	db = sess.DB(dbName)
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	client, err := mongo.Connect(ctx, clientOptions)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	collection = (client.Database(dbName).Collection(collectionName))
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
@@ -58,13 +67,38 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 func fetchTodos(w http.ResponseWriter, r *http.Request) {
 	todos := []todoModel{}
 
-	if err := db.C(collectionName).Find(bson.M{}).All(&todos); err != nil {
+	fetch, err := collection.Find(ctx, bson.M{})
+
+	if err != nil {
 		rnd.JSON(w, http.StatusProcessing, renderer.M{
 			"message": "Failed to fetch todos",
 			"error":   err,
 		})
 		return
 	}
+	defer fetch.Close(ctx)
+
+	for fetch.Next(ctx) {
+		var t todoModel
+		err := fetch.Decode(&t)
+		if err != nil {
+			rnd.JSON(w, http.StatusProcessing, renderer.M{
+				"message": "Failed to fetch todos",
+				"error":   err,
+			})
+			return
+		}
+		todos = append(todos, t)
+	}
+
+	if err := fetch.Err(); err != nil {
+		rnd.JSON(w, http.StatusProcessing, renderer.M{
+			"message": "Failed to fetch todos",
+			"error":   err,
+		})
+		return
+	}
+
 	todoList := []todo{}
 
 	for _, t := range todos {
@@ -102,7 +136,7 @@ func createTodo(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now(),
 	}
 
-	if err := db.C(collectionName).Insert(&tm); err != nil {
+	if _, err := collection.InsertOne(ctx, &tm); err != nil {
 		rnd.JSON(w, http.StatusProcessing, renderer.M{
 			"message": "Failed to save todo",
 			"error":   err,
@@ -117,34 +151,36 @@ func createTodo(w http.ResponseWriter, r *http.Request) {
 }
 
 func deleteTodo(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
 
-	if !bson.IsObjectIdHex(id) {
-		rnd.JSON(w, http.StatusBadRequest, renderer.M{
-			"message": "The id is invalid",
-		})
-		return
-	}
+    if !bson.IsObjectIdHex(id) {
+        rnd.JSON(w, http.StatusBadRequest, renderer.M{
+            "message": "Invalid todo ID",
+        })
+        return
+    }
 
-	if err := db.C(collectionName).RemoveId(bson.ObjectIdHex(id)); err != nil {
-		rnd.JSON(w, http.StatusProcessing, renderer.M{
-			"message": "Failed to delete todo",
-			"error":   err,
-		})
-		return
-	}
+    objID := bson.ObjectIdHex(id)
+    filter := bson.M{"_id": objID}
 
-	rnd.JSON(w, http.StatusOK, renderer.M{
-		"message": "Todo deleted successfully",
-	})
+    if _, err := collection.DeleteOne(ctx, filter, nil); err != nil {
+        rnd.JSON(w, http.StatusProcessing, renderer.M{
+            "message": "Failed to delete todo",
+            "error":   err,
+        })
+        return
+    }
+
+    rnd.JSON(w, http.StatusOK, renderer.M{
+        "message": "Todo deleted successfully",
+    })
 }
 
 func updateTodo(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(chi.URLParam(r, "id"))
-
-	if !bson.IsObjectIdHex(id) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
 		rnd.JSON(w, http.StatusBadRequest, renderer.M{
-			"message": "The id is invalid",
+			"message": "The todo ID is required",
 		})
 		return
 	}
@@ -163,10 +199,16 @@ func updateTodo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := db.C(collectionName).Update(
-		bson.M{"_id": bson.ObjectIdHex(id)},
-		bson.M{"title": t.Title, "completed": t.Completed},
-	); err != nil {
+	filter := bson.M{"_id": bson.ObjectIdHex(id)}
+	update := bson.M{
+		"$set": bson.M{
+			"title":     t.Title,
+			"completed": t.Completed,
+		},
+	}
+
+	_, err := collection.UpdateOne(ctx, filter, update)
+	if err != nil {
 		rnd.JSON(w, http.StatusProcessing, renderer.M{
 			"message": "Failed to update todo",
 			"error":   err,
@@ -180,14 +222,16 @@ func updateTodo(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	stopChan := make(chan os.Signal)
-	signal.Notify(stopChan, os.Interrupt)
+	rnd = renderer.New()
+
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
 	r.Get("/", homeHandler)
+
 	r.Mount("/todo", todoHandlers())
 
-	srv := &http.Server{
+	srv := http.Server{
 		Addr:         port,
 		Handler:      r,
 		ReadTimeout:  60 * time.Second,
@@ -198,16 +242,18 @@ func main() {
 	go func() {
 		log.Println("Listening on port", port)
 		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("Listen:%s/n", err)
+			log.Printf("Listen: %s\n", err)
 		}
 	}()
 
-	<-stopChan
-	log.Println("Shutting down server...")
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	<-c
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	srv.Shutdown(ctx)
 	defer cancel()
+	srv.Shutdown(ctx)
 	log.Println("Server gracefully stopped!")
+	os.Exit(0)
 }
 
 func todoHandlers() http.Handler {
